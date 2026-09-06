@@ -2314,10 +2314,13 @@ exports.install = function (server, app, callbackFunction) {
     }
 
     //Release locks
-    if (releaseLocks && conn) {
+    if (releaseLocks) {
       const userLocks = yield removeUserLocks(ctx, docId, userId);
       if (0 < userLocks.length) {
-        sendReleaseLock(ctx, conn, userLocks);
+        // a lost connection has nobody to notify, but the other participants still must see its locks go
+        if (conn) {
+          sendReleaseLock(ctx, conn, userLocks);
+        }
         yield publish(
           ctx,
           {
@@ -2354,7 +2357,7 @@ exports.install = function (server, app, callbackFunction) {
           ctx.logger.warn('lockDocumentsTimerId timeout');
           delete lockDocumentsTimerId[docId];
           //todo remove checkEndAuthLock(only needed for lost connections in redis)
-          yield* checkEndAuthLock(ctx, true, false, docId, userId);
+          yield* checkEndAuthLock(ctx, true, false, docId, userId, true);
           yield* publishCloseUsersConnection(ctx, docId, [userId], false, constants.DROP_CODE, constants.DROP_REASON);
         } catch (e) {
           ctx.logger.error('lockDocumentsTimerId error: %s', e.stack);
