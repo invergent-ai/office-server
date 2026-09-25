@@ -516,6 +516,14 @@ function signToken(ctx, payload, algorithm, expiresIn, secretElem) {
 function needSendChanges(conn) {
   return !conn.user?.view || utils.isLiveViewer(conn);
 }
+//a forcesave assembles the full file and sends it to the callback on behalf of the user, so a viewer must not trigger it
+function canStartForceSave(conn) {
+  return !!conn.user && !conn.user.view;
+}
+//a session token does not sign the callback, so a reconnect reuses the one its user index registered at open instead of the client value
+function getSessionCallback(ctx, row, userIndex) {
+  return (row?.callback && sqlBase.UserCallback.prototype.getCallbackByUserIndex(ctx, row.callback, userIndex, true)) || undefined;
+}
 function fillJwtByConnection(ctx, conn) {
   return co(function* () {
     const tenTokenSessionAlgorithm = ctx.getCfg('services.CoAuthoring.token.session.algorithm', cfgTokenSessionAlgorithm);
@@ -1086,7 +1094,8 @@ async function startForceSave(
         const selectRes = await taskResult.select(ctx, docId);
         if (selectRes.length > 0) {
           res.code = commonDefines.c_oAscServerCommandErrors.NotModified;
-          if (forceSave) {
+          //the result reaches the browser, and only the relative save needs the link, so never hand out a download link for other types
+          if (forceSave && commonDefines.c_oAscForceSaveTypes.Internal === type) {
             res.url = await getForceSaveUrl(ctx, baseUrl, forceSave.convertInfo);
           }
         } else {
@@ -1252,7 +1261,7 @@ function* startRPC(ctx, conn, responseKey, data) {
   switch (data.type) {
     case 'sendForm': {
       let forceSaveRes;
-      if (conn.user) {
+      if (canStartForceSave(conn)) {
         //isPrint - to remove forms
         const jsonParams = {documentLayout: {isPrint: true}};
         forceSaveRes = yield startForceSave(
@@ -1273,6 +1282,9 @@ function* startRPC(ctx, conn, responseKey, data) {
           undefined,
           jsonParams
         );
+      } else {
+        ctx.logger.warn('startRPC sendForm access deny: view = %s', conn.user?.view);
+        forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null, inProgress: false};
       }
       if (!forceSaveRes || commonDefines.c_oAscServerCommandErrors.NoError !== forceSaveRes.code || forceSaveRes.inProgress) {
         sendDataRpc(ctx, conn, responseKey, forceSaveRes);
@@ -1781,6 +1793,9 @@ exports.getExternalChangeInfo = getExternalChangeInfo;
 exports.checkJwt = checkJwt;
 exports.getRequestParams = getRequestParams;
 exports.checkJwtHeader = checkJwtHeader;
+exports.canStartForceSave = canStartForceSave;
+exports.getSessionCallback = getSessionCallback;
+exports.startRPCPromise = co.wrap(startRPC);
 
 async function encryptPasswordParams(ctx, data) {
   let dataWithPassword;
@@ -1965,7 +1980,7 @@ exports.install = function (server, app, callbackFunction) {
                 break;
               case 'forceSaveStart': {
                 let forceSaveRes;
-                if (conn.user) {
+                if (canStartForceSave(conn)) {
                   forceSaveRes = yield startForceSave(
                     ctx,
                     docId,
@@ -1983,6 +1998,7 @@ exports.install = function (server, app, callbackFunction) {
                     conn
                   );
                 } else {
+                  ctx.logger.warn('forceSaveStart access deny: view = %s', conn.user?.view);
                   forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null};
                 }
                 sendData(ctx, conn, {type: 'forceSaveStart', messages: forceSaveRes});
@@ -2806,6 +2822,7 @@ exports.install = function (server, app, callbackFunction) {
       ctx.setUserId(data.user.id);
       const [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
       let isDecoded = false;
+      let isSessionAuth = false;
       //check jwt
       const token = data.jwtSession || data.jwtOpen;
       if (tenTokenEnableBrowser || token) {
@@ -2821,6 +2838,7 @@ exports.install = function (server, app, callbackFunction) {
           } else if (decoded.editorConfig && undefined !== decoded.editorConfig.ds_sessionTimeConnect) {
             //reconnection
             fillDataFromJwtRes = fillDataFromJwt(ctx, decoded, data);
+            isSessionAuth = true;
           } else if (decoded.version) {
             //version required, but maybe add new type like jwtSession?
             //version history
@@ -2858,6 +2876,12 @@ exports.install = function (server, app, callbackFunction) {
       const docId = data.docid;
       const user = data.user;
 
+      //todo minimize select calls on opening
+      const result = yield taskResult.select(ctx, docId);
+      const resultRow = result.length > 0 ? result[0] : null;
+      if (isSessionAuth) {
+        data.documentCallbackUrl = getSessionCallback(ctx, resultRow, user.indexUser);
+      }
       let wopiParams = null,
         wopiParamsFull = null,
         openedAtStr;
@@ -2875,9 +2899,6 @@ exports.install = function (server, app, callbackFunction) {
           cmd.setWithAuthorization(true);
         }
       }
-      //todo minimize select calls on opening
-      const result = yield taskResult.select(ctx, docId);
-      const resultRow = result.length > 0 ? result[0] : null;
       if (wopiParams) {
         if (resultRow && resultRow.callback) {
           wopiParamsFull = wopiClient.parseWopiCallback(ctx, data.documentCallbackUrl, resultRow.callback);
