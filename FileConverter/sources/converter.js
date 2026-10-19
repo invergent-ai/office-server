@@ -548,35 +548,20 @@ function* downloadFile(ctx, uri, fileFrom, withAuthorization, isInJwtToken, opt_
   return res;
 }
 function* downloadFileFromStorage(ctx, strPath, dir, opt_specialDir) {
-  const list = yield storage.listObjects(ctx, strPath, opt_specialDir);
+  //strPath is a folder. S3 and Azure list by key prefix, so listing "docId_57" also returned "docId_571/...", another
+  //save of the same document; its relative path "/..." made mkdirSync(dir) throw EEXIST and the save was lost.
+  const folder = strPath + '/';
+  const listAll = yield storage.listObjects(ctx, folder, opt_specialDir);
+  const list = listAll.filter(file => file.startsWith(folder) && !file.endsWith('/'));
   ctx.logger.debug('downloadFileFromStorage list %s', list.toString());
-  //create dirs
-  const dirsToCreate = [];
-  const dirStruct = {};
-  list.forEach(file => {
-    let curDirPath = dir;
-    const curDirStruct = dirStruct;
-    const parts = storage.getRelativePath(strPath, file).split('/');
-    for (let i = 0; i < parts.length - 1; ++i) {
-      const part = parts[i];
-      curDirPath = path.join(curDirPath, part);
-      if (!curDirStruct[part]) {
-        curDirStruct[part] = {};
-        dirsToCreate.push(curDirPath);
-      }
-    }
-  });
-  //make dirs
-  for (let i = 0; i < dirsToCreate.length; ++i) {
-    fs.mkdirSync(dirsToCreate[i]);
-  }
   //download
   //todo Promise.all
   for (let i = 0; i < list.length; ++i) {
     const file = list[i];
-    const fileRel = storage.getRelativePath(strPath, file);
+    const filePath = path.join(dir, file.substring(folder.length));
+    fs.mkdirSync(path.dirname(filePath), {recursive: true});
     const data = yield storage.getObject(ctx, file, opt_specialDir);
-    fs.writeFileSync(path.join(dir, fileRel), data);
+    fs.writeFileSync(filePath, data);
   }
   return list.length;
 }
@@ -1178,6 +1163,16 @@ function* spawnProcess(ctx, builderParams, tempDirs, dataConvert, authorProps, g
 }
 
 function* ExecuteTask(ctx, task) {
+  const tempDirs = getTempDir();
+  try {
+    return yield* executeTaskInTempDirs(ctx, task, tempDirs);
+  } catch (err) {
+    //executeTaskInTempDirs removes the temp dir only when it finishes; without this a failed task leaves it in tmpdir
+    fs.rmSync(tempDirs.temp, {recursive: true, force: true});
+    throw err;
+  }
+}
+function* executeTaskInTempDirs(ctx, task, tempDirs) {
   const tenForgottenFiles = ctx.getCfg('services.CoAuthoring.server.forgottenfiles', cfgForgottenFiles);
   const tenForgottenFilesName = ctx.getCfg('services.CoAuthoring.server.forgottenfilesname', cfgForgottenFilesName);
   let startDate = null;
@@ -1190,7 +1185,6 @@ function* ExecuteTask(ctx, task) {
   const dataConvert = new TaskQueueDataConvert(ctx, task);
   ctx.logger.info('Start Task');
   let error = constants.NO_ERROR;
-  const tempDirs = getTempDir();
   const fileTo = task.getToFile();
   dataConvert.fileTo = fileTo ? path.join(tempDirs.result, fileTo) : '';
   const builderParams = cmd.getBuilderParams();
@@ -1395,3 +1389,5 @@ function run() {
   });
 }
 exports.run = run;
+exports.downloadFileFromStorage = downloadFileFromStorage;
+exports.ExecuteTask = ExecuteTask;
