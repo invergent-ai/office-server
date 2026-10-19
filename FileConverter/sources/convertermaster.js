@@ -31,18 +31,20 @@ const config = moduleReloader.requireConfigWithRuntime();
 const logger = require('./../../Common/sources/logger');
 const operationContext = require('./../../Common/sources/operationContext');
 const runtimeConfigManager = require('./../../Common/sources/runtimeConfigManager');
+const {getWorkersCount} = require('./converterWorkers');
 
 if (cluster.isMaster) {
   const os = require('os');
 
   const cfgMaxProcessCount = config.get('FileConverter.converter.maxprocesscount');
+  const cfgWorkers = config.get('FileConverter.converter.workers');
 
   let workersCount = 0;
   const updateWorkersCount = function () {
     const numCPUs = os.cpus().length;
     const availableParallelism = os.availableParallelism?.();
     operationContext.global.logger.warn('num of CPUs: %d; availableParallelism: %s', numCPUs, availableParallelism);
-    workersCount = Math.ceil((availableParallelism || numCPUs) * cfgMaxProcessCount);
+    workersCount = getWorkersCount(cfgWorkers, cfgMaxProcessCount, availableParallelism || numCPUs);
   };
   const updateWorkers = () => {
     let i;
