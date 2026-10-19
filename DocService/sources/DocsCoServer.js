@@ -1110,7 +1110,8 @@ async function startForceSave(
       priority = constants.QUEUE_PRIORITY_VERY_LOW;
       expiration = getForceSaveExpiration(ctx);
     } else {
-      priority = constants.QUEUE_PRIORITY_LOW;
+      //someone waits on this save, nobody on a closing save (saveFromChanges): never queue it below one
+      priority = constants.QUEUE_PRIORITY_NORMAL;
     }
     //start new convert
     const status = await converterService.convertFromChanges(
