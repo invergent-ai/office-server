@@ -59,11 +59,31 @@ const MAX_STORE_SIZE = 1000000;
  * @param {Object} taskqueue
  */
 function repeatResponses(taskqueue) {
-  for (let i = 0; i < taskqueue.addResponseStore.length; ++i) {
-    const content = taskqueue.addResponseStore[i];
-    addResponse(taskqueue, content, () => {});
+  replayStore(taskqueue.addResponseStore, 'addResponseStore', (content, callback) => addResponse(taskqueue, content, callback));
+}
+
+/**
+ * Sends the entries buffered while disconnected. The batch leaves the store first; an entry whose send fails
+ * (no channel, a channel that closes before the confirm, a nack) goes back into it, so the next reconnect replays it.
+ * @param {Array} store - backing array
+ * @param {string} label - store name for logging
+ * @param {function(Object, function(Error)): void} send - sends one entry and calls back with its confirm result
+ */
+function replayStore(store, label, send) {
+  const entries = store.splice(0);
+  for (const entry of entries) {
+    const onSent = err => {
+      if (null != err) {
+        operationContext.global.logger.warn('[AMQP] %s replay failed, kept for the next reconnect: %s', label, err.message);
+        pushBoundedStore(store, entry, label);
+      }
+    };
+    try {
+      send(entry, onSent);
+    } catch (err) {
+      onSent(err);
+    }
   }
-  taskqueue.addResponseStore.length = 0;
 }
 
 function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAddResponseReceive, isEmitDead, isAddDelayed, callback) {
@@ -388,16 +408,10 @@ function repeat(taskqueue) {
   //repeat addTask because they are lost after the reconnection
   //unlike unconfirmed task will come again
   //acknowledge data after reconnect raises an exception 'PRECONDITION_FAILED - unknown delivery tag'
-  for (let i = 0; i < taskqueue.addTaskStore.length; ++i) {
-    const elem = taskqueue.addTaskStore[i];
-    addTask(taskqueue, elem.task, elem.priority, () => {}, elem.expiration, elem.headers);
-  }
-  taskqueue.addTaskStore.length = 0;
-  for (let i = 0; i < taskqueue.addDelayedStore.length; ++i) {
-    const elem = taskqueue.addDelayedStore[i];
-    addDelayed(taskqueue, elem.task, elem.ttl, () => {});
-  }
-  taskqueue.addDelayedStore.length = 0;
+  replayStore(taskqueue.addTaskStore, 'addTaskStore', (elem, callback) =>
+    addTask(taskqueue, elem.task, elem.priority, callback, elem.expiration, elem.headers)
+  );
+  replayStore(taskqueue.addDelayedStore, 'addDelayedStore', (elem, callback) => addDelayed(taskqueue, elem.task, elem.ttl, callback));
 }
 function addTaskRabbit(taskqueue, content, priority, callback, opt_expiration, opt_headers) {
   const options = {persistent: true, priority};
