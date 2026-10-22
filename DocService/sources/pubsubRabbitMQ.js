@@ -39,6 +39,23 @@ const cfgRabbitExchangePubSub = config.util.cloneDeep(config.get('rabbitmq.excha
 const cfgRabbitQueuePubsub = config.util.cloneDeep(config.get('rabbitmq.queuepubsub'));
 const cfgActiveTopicPubSub = constants.ACTIVEMQ_TOPIC_PREFIX + config.get('activemq.topicpubsub');
 
+// Bound the in-memory store to avoid OOM during long broker outages, like the task queue stores.
+const MAX_STORE_SIZE = 1000000;
+
+/**
+ * Buffers a message the channel cannot take now; the next reconnect publishes it.
+ * Drops the oldest message and logs a warning on overflow.
+ * @param {Object} pubsub
+ * @param {Buffer} data
+ */
+function storePublish(pubsub, data) {
+  if (pubsub.publishStore.length >= MAX_STORE_SIZE) {
+    pubsub.publishStore.shift();
+    operationContext.global.logger.warn('[AMQP] publishStore overflow (>%d), oldest message dropped', MAX_STORE_SIZE);
+  }
+  pubsub.publishStore.push(data);
+}
+
 function initRabbit(pubsub, callback) {
   return co(function* () {
     let e = null;
@@ -147,17 +164,24 @@ function clear(pubsub) {
 }
 function repeat(pubsub) {
   return co(function* () {
-    for (let i = 0; i < pubsub.publishStore.length; ++i) {
-      yield publish(pubsub, pubsub.publishStore[i]);
+    //the batch leaves the store first, because publishRabbit stores again a message it cannot send
+    const messages = pubsub.publishStore.splice(0);
+    for (let i = 0; i < messages.length; ++i) {
+      try {
+        yield publish(pubsub, messages[i]);
+      } catch (err) {
+        messages.slice(i).forEach(data => storePublish(pubsub, data));
+        throw err;
+      }
     }
-    pubsub.publishStore.length = 0;
   });
 }
 function publishRabbit(pubsub, data) {
   return new Promise((resolve, _reject) => {
     const ch = pubsub.channelPublish;
     if (!ch) {
-      // channel was cleared between null-check and publish (reconnect)
+      // channel was cleared between null-check and publish (reconnect); the next reconnect publishes it
+      storePublish(pubsub, data);
       return resolve();
     }
     let keepSending;
@@ -165,8 +189,9 @@ function publishRabbit(pubsub, data) {
       // Channels behave like stream.Writable; publish() returns false when backpressured.
       keepSending = ch.publish(pubsub.exchangePublish, '', data);
     } catch (err) {
-      // sync throw from a closed channel (IllegalOperationError)
-      operationContext.global.logger.error('[AMQP] publish error: %s', err?.stack || err);
+      // sync throw from a closed channel (IllegalOperationError); the reconnect it leads to publishes it
+      operationContext.global.logger.error('[AMQP] publish error, kept for the next reconnect: %s', err?.stack || err);
+      storePublish(pubsub, data);
       return resolve();
     }
     if (keepSending) {
@@ -278,7 +303,7 @@ PubsubRabbitMQ.prototype.publish = function (message) {
   if (null != this.channelPublish) {
     return publish(this, data);
   } else {
-    this.publishStore.push(data);
+    storePublish(this, data);
     return Promise.resolve();
   }
 };
