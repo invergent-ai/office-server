@@ -25,7 +25,7 @@
 
 'use strict';
 const config = require('config');
-const amqp = require('amqplib/callback_api');
+const amqp = require('amqplib');
 const operationContext = require('./operationContext');
 
 const cfgRabbitUrl = config.get('rabbitmq.url');
@@ -36,11 +36,8 @@ const RECONNECT_TIMEOUT = 1000;
 function connetPromise(closeCallback) {
   return new Promise((resolve, _reject) => {
     function startConnect() {
-      amqp.connect(cfgRabbitUrl, cfgRabbitSocketOptions, (err, conn) => {
-        if (null != err) {
-          operationContext.global.logger.error('[AMQP] %s', err.stack);
-          setTimeout(startConnect, RECONNECT_TIMEOUT);
-        } else {
+      amqp.connect(cfgRabbitUrl, cfgRabbitSocketOptions).then(
+        conn => {
           conn.on('error', err => {
             operationContext.global.logger.error('[AMQP] conn error', err.stack);
           });
@@ -53,44 +50,25 @@ function connetPromise(closeCallback) {
           conn.on('close', closeEventCallback);
           operationContext.global.logger.debug('[AMQP] connected');
           resolve(conn);
+        },
+        err => {
+          operationContext.global.logger.error('[AMQP] %s', err.stack);
+          setTimeout(startConnect, RECONNECT_TIMEOUT);
         }
-      });
+      );
     }
     startConnect();
   });
 }
-function createChannelPromise(conn) {
-  return new Promise((resolve, reject) => {
-    conn.createChannel((err, channel) => {
-      if (null != err) {
-        reject(err);
-      } else {
-        resolve(channel);
-      }
-    });
-  });
+async function createChannelPromise(conn) {
+  return conn.createChannel();
 }
-function createConfirmChannelPromise(conn) {
-  return new Promise((resolve, reject) => {
-    conn.createConfirmChannel((err, channel) => {
-      if (null != err) {
-        reject(err);
-      } else {
-        resolve(channel);
-      }
-    });
-  });
+async function createConfirmChannelPromise(conn) {
+  return conn.createConfirmChannel();
 }
-function assertExchangePromise(channel, exchange, type, options) {
-  return new Promise((resolve, reject) => {
-    channel.assertExchange(exchange, type, options, (err, ok) => {
-      if (null != err) {
-        reject(err);
-      } else {
-        resolve(ok.exchange);
-      }
-    });
-  });
+async function assertExchangePromise(channel, exchange, type, options) {
+  const ok = await channel.assertExchange(exchange, type, options);
+  return ok.exchange;
 }
 
 /**
@@ -142,38 +120,16 @@ function filterQueueOptions(options, queueName) {
   return filteredOptions;
 }
 
-function assertQueuePromise(channel, queue, options) {
-  return new Promise((resolve, reject) => {
-    channel.assertQueue(queue, options, (err, ok) => {
-      if (null != err) {
-        reject(err);
-      } else {
-        resolve(ok.queue);
-      }
-    });
-  });
+async function assertQueuePromise(channel, queue, options) {
+  const ok = await channel.assertQueue(queue, options);
+  return ok.queue;
 }
-function consumePromise(channel, queue, messageCallback, options) {
-  return new Promise((resolve, reject) => {
-    channel.consume(queue, messageCallback, options, (err, ok) => {
-      if (null != err) {
-        reject(err);
-      } else {
-        resolve(ok);
-      }
-    });
-  });
+async function consumePromise(channel, queue, messageCallback, options) {
+  return channel.consume(queue, messageCallback, options);
 }
-function closePromise(conn) {
-  return new Promise((resolve, reject) => {
-    conn.close(err => {
-      if (err) {
-        reject(err);
-      } else {
-        resolve();
-      }
-    });
-  });
+//closes a connection or a channel
+async function closePromise(conn) {
+  await conn.close();
 }
 
 module.exports.connetPromise = connetPromise;
