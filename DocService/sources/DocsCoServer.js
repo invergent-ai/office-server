@@ -86,6 +86,7 @@ const sqlBase = require('./databaseConnectors/baseConnector');
 const canvasService = require('./canvasservice');
 const converterService = require('./converterservice');
 const taskResult = require('./taskresult');
+const documentRecovery = require('./documentRecovery');
 const gc = require('./gc');
 const shutdown = require('./shutdown');
 const pubsubService = require('./pubsubRabbitMQ');
@@ -515,6 +516,14 @@ function signToken(ctx, payload, algorithm, expiresIn, secretElem) {
 function needSendChanges(conn) {
   return !conn.user?.view || utils.isLiveViewer(conn);
 }
+//a forcesave assembles the full file and sends it to the callback on behalf of the user, so a viewer must not trigger it
+function canStartForceSave(conn) {
+  return !!conn.user && !conn.user.view;
+}
+//a session token does not sign the callback, so a reconnect reuses the one its user index registered at open instead of the client value
+function getSessionCallback(ctx, row, userIndex) {
+  return (row?.callback && sqlBase.UserCallback.prototype.getCallbackByUserIndex(ctx, row.callback, userIndex, true)) || undefined;
+}
 function fillJwtByConnection(ctx, conn) {
   return co(function* () {
     const tenTokenSessionAlgorithm = ctx.getCfg('services.CoAuthoring.token.session.algorithm', cfgTokenSessionAlgorithm);
@@ -529,7 +538,8 @@ function fillJwtByConnection(ctx, conn) {
     //todo
     //edit.callbackUrl = callbackUrl;
     //edit.lang = conn.lang;
-    //edit.mode = conn.mode;
+    // the mode must come back on reconnect, otherwise the client alone decides it and a viewer returns as an editor
+    edit.mode = conn.mode;
     const user = edit.user;
     user.id = conn.user.idOriginal;
     user.name = conn.user.username;
@@ -754,7 +764,8 @@ async function sendServerRequest(ctx, uri, dataObject, opt_checkAndFixAuthorizat
     }
     dataObject.setToken(bodyToken);
   }
-  const headers = {'Content-Type': 'application/json'};
+  // Status callbacks are one-shot POSTs; do not reuse stale keep-alive sockets.
+  const headers = {'Content-Type': 'application/json', Connection: 'close'};
   //isInJwtToken is true because callbackUrl is required field in jwt token
   const postRes = await utils.postRequestPromise(
     ctx,
@@ -1083,7 +1094,8 @@ async function startForceSave(
         const selectRes = await taskResult.select(ctx, docId);
         if (selectRes.length > 0) {
           res.code = commonDefines.c_oAscServerCommandErrors.NotModified;
-          if (forceSave) {
+          //the result reaches the browser, and only the relative save needs the link, so never hand out a download link for other types
+          if (forceSave && commonDefines.c_oAscForceSaveTypes.Internal === type) {
             res.url = await getForceSaveUrl(ctx, baseUrl, forceSave.convertInfo);
           }
         } else {
@@ -1249,7 +1261,7 @@ function* startRPC(ctx, conn, responseKey, data) {
   switch (data.type) {
     case 'sendForm': {
       let forceSaveRes;
-      if (conn.user) {
+      if (canStartForceSave(conn)) {
         //isPrint - to remove forms
         const jsonParams = {documentLayout: {isPrint: true}};
         forceSaveRes = yield startForceSave(
@@ -1270,6 +1282,9 @@ function* startRPC(ctx, conn, responseKey, data) {
           undefined,
           jsonParams
         );
+      } else {
+        ctx.logger.warn('startRPC sendForm access deny: view = %s', conn.user?.view);
+        forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null, inProgress: false};
       }
       if (!forceSaveRes || commonDefines.c_oAscServerCommandErrors.NoError !== forceSaveRes.code || forceSaveRes.inProgress) {
         sendDataRpc(ctx, conn, responseKey, forceSaveRes);
@@ -1778,6 +1793,9 @@ exports.getExternalChangeInfo = getExternalChangeInfo;
 exports.checkJwt = checkJwt;
 exports.getRequestParams = getRequestParams;
 exports.checkJwtHeader = checkJwtHeader;
+exports.canStartForceSave = canStartForceSave;
+exports.getSessionCallback = getSessionCallback;
+exports.startRPCPromise = co.wrap(startRPC);
 
 async function encryptPasswordParams(ctx, data) {
   let dataWithPassword;
@@ -1896,7 +1914,13 @@ exports.install = function (server, app, callbackFunction) {
               (conn.isCloseCoAuthoring || (conn.user && conn.user.view)) &&
               ('getLock' == data.type || 'saveChanges' == data.type || 'isSaveLock' == data.type)
             ) {
-              ctx.logger.warn('conn.user.view||isCloseCoAuthoring access deny: type = %s', data.type);
+              ctx.logger.warn(
+                'conn.user.view||isCloseCoAuthoring access deny: type = %s; view = %s; isCloseCoAuthoring = %s; editorType = %s',
+                data.type,
+                conn.user?.view,
+                conn.isCloseCoAuthoring,
+                conn.editorType
+              );
               sendDataDisconnectReason(ctx, conn, constants.ACCESS_DENIED_CODE, constants.ACCESS_DENIED_REASON);
               conn.disconnect(true);
               return;
@@ -1956,7 +1980,7 @@ exports.install = function (server, app, callbackFunction) {
                 break;
               case 'forceSaveStart': {
                 let forceSaveRes;
-                if (conn.user) {
+                if (canStartForceSave(conn)) {
                   forceSaveRes = yield startForceSave(
                     ctx,
                     docId,
@@ -1974,6 +1998,7 @@ exports.install = function (server, app, callbackFunction) {
                     conn
                   );
                 } else {
+                  ctx.logger.warn('forceSaveStart access deny: view = %s', conn.user?.view);
                   forceSaveRes = {code: commonDefines.c_oAscServerCommandErrors.UnknownError, time: null};
                 }
                 sendData(ctx, conn, {type: 'forceSaveStart', messages: forceSaveRes});
@@ -2566,10 +2591,10 @@ exports.install = function (server, app, callbackFunction) {
     return name;
   }
   function isEditMode(permissions, mode) {
-    //like this.api.asc_setViewMode(!this.appOptions.isEdit && !this.appOptions.isRestrictedEdit);
-    //https://github.com/ONLYOFFICE/web-apps/blob/4a7879b4f88f315fe94d9f7d97c0ed8aa9f82221/apps/documenteditor/main/app/controller/Main.js#L1743
-    //todo permissions in embed editor
-    //https://github.com/ONLYOFFICE/web-apps/blob/72b8350c71e7b314b63b8eec675e76156bb4a2e4/apps/documenteditor/forms/app/controller/ApplicationController.js#L627
+    // this is the ceiling of rights taken from the token, not a copy of any client formula
+    // the client may only lower it, by sending mode 'view' or by calling asc_setCanSendChanges, and the server sees only the first
+    // every client condition that allows writing to the server must stay a subset of this
+    //todo the ceiling ignores editorType and fileType, so fillForms and review count even for editors that do not support them
     return (
       (!mode || mode !== 'view') &&
       (!permissions || permissions.edit !== false || permissions.review === true || permissions.comment === true || permissions.fillForms === true)
@@ -2792,11 +2817,12 @@ exports.install = function (server, app, callbackFunction) {
     const tenTokenRequiredParams = ctx.getCfg('services.CoAuthoring.server.tokenRequiredParams', cfgTokenRequiredParams);
 
     //TODO: Do authorization etc. check md5 or query db
-    ctx.logger.debug('auth time: %d', data.time);
+    ctx.logger.debug('auth time: %d; requestedMode = %s; format = %s', data.time, data.mode, data.openCmd?.format);
     if (data.token && data.user) {
       ctx.setUserId(data.user.id);
       const [licenseInfo] = yield tenantManager.getTenantLicense(ctx);
       let isDecoded = false;
+      let isSessionAuth = false;
       //check jwt
       const token = data.jwtSession || data.jwtOpen;
       if (tenTokenEnableBrowser || token) {
@@ -2812,6 +2838,7 @@ exports.install = function (server, app, callbackFunction) {
           } else if (decoded.editorConfig && undefined !== decoded.editorConfig.ds_sessionTimeConnect) {
             //reconnection
             fillDataFromJwtRes = fillDataFromJwt(ctx, decoded, data);
+            isSessionAuth = true;
           } else if (decoded.version) {
             //version required, but maybe add new type like jwtSession?
             //version history
@@ -2849,6 +2876,12 @@ exports.install = function (server, app, callbackFunction) {
       const docId = data.docid;
       const user = data.user;
 
+      //todo minimize select calls on opening
+      const result = yield taskResult.select(ctx, docId);
+      const resultRow = result.length > 0 ? result[0] : null;
+      if (isSessionAuth) {
+        data.documentCallbackUrl = getSessionCallback(ctx, resultRow, user.indexUser);
+      }
       let wopiParams = null,
         wopiParamsFull = null,
         openedAtStr;
@@ -2866,9 +2899,6 @@ exports.install = function (server, app, callbackFunction) {
           cmd.setWithAuthorization(true);
         }
       }
-      //todo minimize select calls on opening
-      const result = yield taskResult.select(ctx, docId);
-      const resultRow = result.length > 0 ? result[0] : null;
       if (wopiParams) {
         if (resultRow && resultRow.callback) {
           wopiParamsFull = wopiClient.parseWopiCallback(ctx, data.documentCallbackUrl, resultRow.callback);
@@ -2949,6 +2979,7 @@ exports.install = function (server, app, callbackFunction) {
       conn.tenant = tenantManager.getTenantByConnection(ctx, conn);
       conn.docId = data.docid;
       conn.permissions = data.permissions;
+      conn.mode = data.mode;
       conn.user = {
         id: curUserId,
         idOriginal: curUserIdOriginal,
@@ -3156,7 +3187,7 @@ exports.install = function (server, app, callbackFunction) {
       } else {
         conn.sessionId = conn.id;
         const openedAt = openedAtStr ? sqlBase.DocumentAdditional.prototype.getOpenedAt(openedAtStr) : canvasService.getOpenedAt(resultRow);
-        const endAuthRes = yield* endAuth(ctx, conn, false, documentCallback, openedAt);
+        const endAuthRes = yield* endAuth(ctx, conn, false, documentCallback, openedAt, resultRow);
         if (endAuthRes && cmd) {
           //todo to allow forcesave TemplateSource after convertion(move to better place)
           if (wopiParamsFull?.commonInfo?.fileInfo?.TemplateSource) {
@@ -3170,7 +3201,7 @@ exports.install = function (server, app, callbackFunction) {
     }
   }
 
-  function* endAuth(ctx, conn, bIsRestore, documentCallback, opt_openedAt) {
+  function* endAuth(ctx, conn, bIsRestore, documentCallback, opt_openedAt, opt_resultRow) {
     const tenExpLockDoc = ctx.getCfg('services.CoAuthoring.expire.lockDoc', cfgExpLockDoc);
     const tenForgottenFiles = ctx.getCfg('services.CoAuthoring.server.forgottenfiles', cfgForgottenFiles);
 
@@ -3214,7 +3245,8 @@ exports.install = function (server, app, callbackFunction) {
         const forgotten = yield storage.listObjects(ctx, docId, tenForgottenFiles);
         hasForgotten = forgotten.length > 0;
         ctx.logger.debug('endAuth hasForgotten %s', hasForgotten);
-        if (hasForgotten) {
+        // The recovery marker is not consumed, so a fresh editor open re-sends this warning until the marker clears.
+        if (hasForgotten || documentRecovery.isAssemblyRecovery(opt_resultRow)) {
           sendDataWarning(ctx, conn, constants.FILE_NOT_ASSEMBLED, 'File not assembled');
         }
       }

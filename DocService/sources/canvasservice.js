@@ -36,6 +36,7 @@ const sqlBase = require('./databaseConnectors/baseConnector');
 const utilsDocService = require('./utilsDocService');
 const docsCoServer = require('./DocsCoServer');
 const taskResult = require('./taskresult');
+const documentRecovery = require('./documentRecovery');
 const wopiUtils = require('./wopiUtils');
 const wopiClient = require('./wopiClient');
 const utils = require('./../../Common/sources/utils');
@@ -1046,13 +1047,18 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
     const forceSaveType = forceSave ? forceSave.getType() : commonDefines.c_oAscForceSaveTypes.Command;
     const forceSaveUserId = forceSave ? forceSave.getAuthorUserId() : undefined;
     const forceSaveUserIndex = forceSave ? forceSave.getAuthorUserIndex() : undefined;
-    const callbackUserIndex = forceSaveUserIndex || 0 === forceSaveUserIndex ? forceSaveUserIndex : userLastChangeIndex;
+    const hasForceSaveAuthor = forceSaveUserIndex || 0 === forceSaveUserIndex;
+    const callbackUserIndex = hasForceSaveAuthor ? forceSaveUserIndex : userLastChangeIndex;
+    const exactCallback =
+      hasForceSaveAuthor &&
+      (commonDefines.c_oAscForceSaveTypes.Button === forceSaveType || commonDefines.c_oAscForceSaveTypes.Form === forceSaveType);
     let uri, baseUrl, wopiParams, lastOpenDate;
     const selectRes = yield taskResult.select(ctx, docId);
     const row = selectRes.length > 0 ? selectRes[0] : null;
     if (row) {
       if (row.callback) {
-        uri = sqlBase.UserCallback.prototype.getCallbackByUserIndex(ctx, row.callback, callbackUserIndex);
+        //a user-initiated forcesave goes only to its author's callback; timers keep their existing fallback
+        uri = sqlBase.UserCallback.prototype.getCallbackByUserIndex(ctx, row.callback, callbackUserIndex, exactCallback);
         wopiParams = wopiClient.parseWopiCallback(ctx, uri, row.callback);
       }
       if (row.baseurl) {
@@ -1260,7 +1266,8 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
             if (replyData && commonDefines.c_oAscServerCommandErrors.NoError != replyData.error) {
               ctx.logger.warn('sendServerRequest returned an error: data = %s', replyStr);
             }
-            if (requestRes) {
+            // A callback ACK for Corrupted only confirms handling; a missing assembly output is still not a successful save.
+            if (requestRes && (!isError || isErrorCorrupted)) {
               isSfcSuccess = true;
               updateIfTask = undefined;
               yield docsCoServer.cleanDocumentOnExitPromise(ctx, docId, true, callbackUserIndex);
@@ -1276,7 +1283,7 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
                   clientStatsD.timing('coauth.saveAfterEditingSessionClosed', time);
                 }
               }
-            } else {
+            } else if (!requestRes) {
               storeForgotten = true;
             }
           } else {
@@ -1292,6 +1299,13 @@ const commandSfcCallback = co.wrap(function* (ctx, cmd, isSfcm, isEncrypted) {
       storeForgotten = true;
     }
     if (undefined !== updateIfTask && !isSfcm) {
+      // Terminal assembly error with no retry: release SaveVersion (no new open conversion), keep pending changes for replay.
+      const isTerminalAssemblyError =
+        commonDefines.FileStatus.SaveVersion === recoverTask.status && !needRetry && !isEncrypted && isError && !isErrorCorrupted;
+      if (isTerminalAssemblyError) {
+        ctx.logger.warn('commandSfcCallback release SaveVersion after assembly error without output: statusInfo = %d', statusInfo);
+        documentRecovery.markAssemblyRecovery(recoverTask);
+      }
       ctx.logger.debug('commandSfcCallback restore %d status', recoverTask.status);
       updateIfTask.status = recoverTask.status;
       updateIfTask.statusInfo = recoverTask.statusInfo;
@@ -1661,7 +1675,7 @@ function getPrintFileUrl(ctx, docId, baseUrl, filename) {
     const tenTokenSessionExpires = ms(ctx.getCfg('services.CoAuthoring.token.session.expires', cfgTokenSessionExpires));
 
     baseUrl = utils.checkBaseUrl(ctx, baseUrl);
-    const payload = {document: {key: docId}};
+    const payload = {document: {key: docId}, ds_tokenType: 'printfile'};
     const token = yield docsCoServer.signToken(
       ctx,
       payload,
@@ -1707,7 +1721,7 @@ exports.printFile = function (req, res) {
       const checkJwtRes = yield docsCoServer.checkJwt(ctx, token, commonDefines.c_oAscSecretType.Session);
       if (checkJwtRes.decoded) {
         const docIdBase = checkJwtRes.decoded.document.key;
-        if (!docId.startsWith(docIdBase)) {
+        if (docId !== docIdBase || checkJwtRes.decoded.ds_tokenType !== 'printfile') {
           ctx.logger.warn('Error printFile jwt: description = %s', 'access deny');
           res.sendStatus(403);
           return;
@@ -1745,6 +1759,7 @@ exports.downloadFile = function (req, res) {
   return co(function* () {
     const ctx = new operationContext.Context();
     let stream = null;
+    let upstreamStream = null;
     try {
       let startDate = null;
       if (clientStatsD) {
@@ -1858,6 +1873,7 @@ exports.downloadFile = function (req, res) {
         );
         const response = downloadResult.response;
         stream = downloadResult.stream;
+        upstreamStream = response.data;
         // Sanitize Content-Disposition by removing control chars (prevents CRLF/header injection)
         if (response.headers['content-disposition']) {
           response.headers['content-disposition'] = response.headers['content-disposition'].replace(/\p{Cc}/gu, '');
@@ -1900,12 +1916,14 @@ exports.downloadFile = function (req, res) {
         }
       }
     } finally {
-      // Ensure stream is properly destroyed
-      if (stream && typeof stream.destroy === 'function') {
-        try {
-          stream.destroy();
-        } catch (destroyErr) {
-          ctx.logger.warn('Error destroying stream: %s', destroyErr.stack);
+      // pipe() does not propagate destroy, so close the upstream response too or the source server stalls until the whole cycle timeout
+      for (const streamToDestroy of [upstreamStream, stream]) {
+        if (streamToDestroy && typeof streamToDestroy.destroy === 'function') {
+          try {
+            streamToDestroy.destroy();
+          } catch (destroyErr) {
+            ctx.logger.warn('Error destroying stream: %s', destroyErr.stack);
+          }
         }
       }
       ctx.logger.info('End downloadFile');

@@ -49,6 +49,43 @@ const cfgActiveQueueConvertResponse = constants.ACTIVEMQ_QUEUE_PREFIX + config.g
 const cfgActiveQueueConvertDead = constants.ACTIVEMQ_QUEUE_PREFIX + config.get('activemq.queueconvertdead');
 const cfgActiveQueueDelayed = constants.ACTIVEMQ_QUEUE_PREFIX + config.get('activemq.queuedelayed');
 
+// Bound the in-memory store to avoid OOM during long broker outages.
+const MAX_STORE_SIZE = 1000000;
+
+/**
+ * Publishes buffered responses after reconnect. Responses are replayed before
+ * delayed tasks because they represent completed work that callers are already
+ * waiting for.
+ * @param {Object} taskqueue
+ */
+function repeatResponses(taskqueue) {
+  replayStore(taskqueue.addResponseStore, 'addResponseStore', (content, callback) => addResponse(taskqueue, content, callback));
+}
+
+/**
+ * Sends the entries buffered while disconnected. The batch leaves the store first; an entry whose send fails
+ * (no channel, a channel that closes before the confirm, a nack) goes back into it, so the next reconnect replays it.
+ * @param {Array} store - backing array
+ * @param {string} label - store name for logging
+ * @param {function(Object, function(Error)): void} send - sends one entry and calls back with its confirm result
+ */
+function replayStore(store, label, send) {
+  const entries = store.splice(0);
+  for (const entry of entries) {
+    const onSent = err => {
+      if (null != err) {
+        operationContext.global.logger.warn('[AMQP] %s replay failed, kept for the next reconnect: %s', label, err.message);
+        pushBoundedStore(store, entry, label);
+      }
+    };
+    try {
+      send(entry, onSent);
+    } catch (err) {
+      onSent(err);
+    }
+  }
+}
+
 function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAddResponseReceive, isEmitDead, isAddDelayed, callback) {
   return co(function* () {
     let e = null;
@@ -62,6 +99,7 @@ function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAdd
         }
       });
       taskqueue.connection = conn;
+      const onChannelDead = rabbitMQCore.createOnChannelDead(taskqueue, conn);
       let bAssertTaskQueue = false;
       const optionsTaskQueueDefault = {
         messageTtl: cfgQueueRetentionPeriod * 1000,
@@ -72,13 +110,13 @@ function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAdd
         cfgRabbitQueueConvertTask.name
       );
       if (isAddTask) {
-        taskqueue.channelConvertTask = yield rabbitMQCore.createConfirmChannelPromise(conn);
+        taskqueue.channelConvertTask = yield rabbitMQCore.createConfirmChannelPromise(conn, onChannelDead);
         yield rabbitMQCore.assertQueuePromise(taskqueue.channelConvertTask, cfgRabbitQueueConvertTask.name, optionsTaskQueue);
         bAssertTaskQueue = true;
       }
       let bAssertResponseQueue = false;
       if (isAddResponse) {
-        taskqueue.channelConvertResponse = yield rabbitMQCore.createConfirmChannelPromise(conn);
+        taskqueue.channelConvertResponse = yield rabbitMQCore.createConfirmChannelPromise(conn, onChannelDead);
         const filteredResponseOptions = rabbitMQCore.filterQueueOptions(
           {...cfgRabbitQueueConvertResponse.options},
           cfgRabbitQueueConvertResponse.name
@@ -88,18 +126,19 @@ function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAdd
       }
       const optionsReceive = {noAck: false};
       if (isAddTaskReceive) {
-        taskqueue.channelConvertTaskReceive = yield rabbitMQCore.createChannelPromise(conn);
-        taskqueue.channelConvertTaskReceive.prefetch(1);
+        const receiveChannel = yield rabbitMQCore.createChannelPromise(conn, onChannelDead);
+        taskqueue.channelConvertTaskReceive = receiveChannel;
+        yield receiveChannel.prefetch(1);
         if (!bAssertTaskQueue) {
-          yield rabbitMQCore.assertQueuePromise(taskqueue.channelConvertTaskReceive, cfgRabbitQueueConvertTask.name, optionsTaskQueue);
+          yield rabbitMQCore.assertQueuePromise(receiveChannel, cfgRabbitQueueConvertTask.name, optionsTaskQueue);
         }
         yield rabbitMQCore.consumePromise(
-          taskqueue.channelConvertTaskReceive,
+          receiveChannel,
           cfgRabbitQueueConvertTask.name,
           message => {
             co(function* () {
               const ack = function () {
-                taskqueue.channelConvertTaskReceive && taskqueue.channelConvertTaskReceive.ack(message);
+                rabbitMQCore.safeAck(receiveChannel, message, 'task');
               };
               const redelivered = yield* pushBackRedeliveredRabbit(taskqueue, message, ack);
               if (!redelivered) {
@@ -113,21 +152,22 @@ function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAdd
         );
       }
       if (isAddResponseReceive) {
-        taskqueue.channelConvertResponseReceive = yield rabbitMQCore.createChannelPromise(conn);
+        const receiveChannel = yield rabbitMQCore.createChannelPromise(conn, onChannelDead);
+        taskqueue.channelConvertResponseReceive = receiveChannel;
         if (!bAssertResponseQueue) {
           const filteredResponseOptions = rabbitMQCore.filterQueueOptions(
             {...cfgRabbitQueueConvertResponse.options},
             cfgRabbitQueueConvertResponse.name
           );
-          yield rabbitMQCore.assertQueuePromise(taskqueue.channelConvertResponseReceive, cfgRabbitQueueConvertResponse.name, filteredResponseOptions);
+          yield rabbitMQCore.assertQueuePromise(receiveChannel, cfgRabbitQueueConvertResponse.name, filteredResponseOptions);
         }
         yield rabbitMQCore.consumePromise(
-          taskqueue.channelConvertResponseReceive,
+          receiveChannel,
           cfgRabbitQueueConvertResponse.name,
           message => {
             if (message) {
               taskqueue.emit('response', message.content.toString(), () => {
-                taskqueue.channelConvertResponseReceive && taskqueue.channelConvertResponseReceive.ack(message);
+                rabbitMQCore.safeAck(receiveChannel, message, 'response');
               });
             }
           },
@@ -142,39 +182,38 @@ function initRabbit(taskqueue, isAddTask, isAddResponse, isAddTaskReceive, isAdd
           {...optionsDelayedQueueDefault, ...cfgRabbitQueueDelayed.options},
           cfgRabbitQueueDelayed.name
         );
-        taskqueue.channelDelayed = yield rabbitMQCore.createConfirmChannelPromise(conn);
+        taskqueue.channelDelayed = yield rabbitMQCore.createConfirmChannelPromise(conn, onChannelDead);
         yield rabbitMQCore.assertQueuePromise(taskqueue.channelDelayed, cfgRabbitQueueDelayed.name, optionsDelayedQueue);
       }
       if (isEmitDead) {
-        taskqueue.channelConvertDead = yield rabbitMQCore.createChannelPromise(conn);
-        yield rabbitMQCore.assertExchangePromise(
-          taskqueue.channelConvertDead,
-          cfgRabbitExchangeConvertDead.name,
-          'fanout',
-          cfgRabbitExchangeConvertDead.options
-        );
+        const deadChannel = yield rabbitMQCore.createChannelPromise(conn, onChannelDead);
+        taskqueue.channelConvertDead = deadChannel;
+        yield rabbitMQCore.assertExchangePromise(deadChannel, cfgRabbitExchangeConvertDead.name, 'fanout', cfgRabbitExchangeConvertDead.options);
         const filteredDeadOptions = rabbitMQCore.filterQueueOptions({...cfgRabbitQueueConvertDead.options}, cfgRabbitQueueConvertDead.name);
-        const queue = yield rabbitMQCore.assertQueuePromise(taskqueue.channelConvertDead, cfgRabbitQueueConvertDead.name, filteredDeadOptions);
+        const queue = yield rabbitMQCore.assertQueuePromise(deadChannel, cfgRabbitQueueConvertDead.name, filteredDeadOptions);
 
-        taskqueue.channelConvertDead.bindQueue(queue, cfgRabbitExchangeConvertDead.name, '');
+        yield rabbitMQCore.bindQueuePromise(deadChannel, queue, cfgRabbitExchangeConvertDead.name, '');
         yield rabbitMQCore.consumePromise(
-          taskqueue.channelConvertDead,
+          deadChannel,
           queue,
           message => {
-            if (null != taskqueue.channelConvertDead) {
-              if (message) {
-                taskqueue.emit('dead', message.content.toString(), () => {
-                  taskqueue.channelConvertDead.ack(message);
-                });
-              }
+            if (message) {
+              taskqueue.emit('dead', message.content.toString(), () => {
+                rabbitMQCore.safeAck(deadChannel, message, 'dead');
+              });
             }
           },
           {noAck: false}
         );
       }
 
+      taskqueue.reconnecting = false;
       //process messages received while reconnection time
-      repeat(taskqueue);
+      try {
+        repeat(taskqueue);
+      } catch (err) {
+        operationContext.global.logger.error('[AMQP] repeat on reconnect failed: %s', err?.stack || err);
+      }
     } catch (err) {
       e = err;
     }
@@ -317,6 +356,8 @@ function clear(taskqueue) {
   taskqueue.channelConvertResponse = null;
   taskqueue.channelConvertResponseReceive = null;
   taskqueue.channelDelayed = null;
+  taskqueue.connection = null;
+  taskqueue.reconnecting = false;
   //todo clear all listeners
   taskqueue.channelConvertTaskData = {};
   taskqueue.channelConvertResponseData = {};
@@ -363,19 +404,14 @@ function* pushBackRedeliveredActive(taskqueue, context, ack) {
   return false;
 }
 function repeat(taskqueue) {
+  repeatResponses(taskqueue);
   //repeat addTask because they are lost after the reconnection
   //unlike unconfirmed task will come again
   //acknowledge data after reconnect raises an exception 'PRECONDITION_FAILED - unknown delivery tag'
-  for (let i = 0; i < taskqueue.addTaskStore.length; ++i) {
-    const elem = taskqueue.addTaskStore[i];
-    addTask(taskqueue, elem.task, elem.priority, () => {}, elem.expiration, elem.headers);
-  }
-  taskqueue.addTaskStore.length = 0;
-  for (let i = 0; i < taskqueue.addDelayedStore.length; ++i) {
-    const elem = taskqueue.addDelayedStore[i];
-    addDelayed(taskqueue, elem.task, elem.ttl, () => {});
-  }
-  taskqueue.addDelayedStore.length = 0;
+  replayStore(taskqueue.addTaskStore, 'addTaskStore', (elem, callback) =>
+    addTask(taskqueue, elem.task, elem.priority, callback, elem.expiration, elem.headers)
+  );
+  replayStore(taskqueue.addDelayedStore, 'addDelayedStore', (elem, callback) => addDelayed(taskqueue, elem.task, elem.ttl, callback));
 }
 function addTaskRabbit(taskqueue, content, priority, callback, opt_expiration, opt_headers) {
   const options = {persistent: true, priority};
@@ -385,7 +421,17 @@ function addTaskRabbit(taskqueue, content, priority, callback, opt_expiration, o
   if (undefined !== opt_headers) {
     options.headers = opt_headers;
   }
-  taskqueue.channelConvertTask.sendToQueue(cfgRabbitQueueConvertTask.name, content, options, callback);
+  const ch = taskqueue.channelConvertTask;
+  if (!ch) {
+    callback(new Error('[AMQP] channelConvertTask is not available'));
+    return;
+  }
+  try {
+    ch.sendToQueue(cfgRabbitQueueConvertTask.name, content, options, callback);
+  } catch (err) {
+    // Closed channel throws synchronously; propagate to callback so caller can retry/store.
+    callback(err);
+  }
 }
 function addTaskActive(taskqueue, content, priority, callback, opt_expiration, _opt_headers) {
   const msg = {durable: true, priority, body: content, ttl: cfgQueueRetentionPeriod * 1000};
@@ -417,14 +463,38 @@ function addTaskString(taskqueue, task, priority, opt_expiration, opt_headers) {
         opt_headers
       );
     } else {
-      taskqueue.addTaskStore.push({task: content, priority, expiration: opt_expiration, headers: opt_headers});
+      pushBoundedStore(taskqueue.addTaskStore, {task: content, priority, expiration: opt_expiration, headers: opt_headers}, 'addTaskStore');
       resolve();
     }
   });
 }
+
+/**
+ * Push with bounded capacity; drops oldest entry and logs a warning on overflow.
+ * Prevents unbounded heap growth during long broker outages.
+ * @param {Array} store - backing array
+ * @param {Object} item - entry to push
+ * @param {string} label - store name for logging
+ */
+function pushBoundedStore(store, item, label) {
+  if (store.length >= MAX_STORE_SIZE) {
+    store.shift();
+    operationContext.global.logger.warn('[AMQP] %s overflow (>%d), oldest entry dropped', label, MAX_STORE_SIZE);
+  }
+  store.push(item);
+}
 function addResponseRabbit(taskqueue, content, callback) {
   const options = {persistent: true};
-  taskqueue.channelConvertResponse.sendToQueue(cfgRabbitQueueConvertResponse.name, content, options, callback);
+  const ch = taskqueue.channelConvertResponse;
+  if (!ch) {
+    callback(new Error('[AMQP] channelConvertResponse is not available'));
+    return;
+  }
+  try {
+    ch.sendToQueue(cfgRabbitQueueConvertResponse.name, content, options, callback);
+  } catch (err) {
+    callback(err);
+  }
 }
 function addResponseActive(taskqueue, content, callback) {
   const msg = {durable: true, body: content};
@@ -441,7 +511,16 @@ function closeActive(conn) {
 }
 function addDelayedRabbit(taskqueue, content, ttl, callback) {
   const options = {persistent: true, expiration: ttl.toString()};
-  taskqueue.channelDelayed.sendToQueue(cfgRabbitQueueDelayed.name, content, options, callback);
+  const ch = taskqueue.channelDelayed;
+  if (!ch) {
+    callback(new Error('[AMQP] channelDelayed is not available'));
+    return;
+  }
+  try {
+    ch.sendToQueue(cfgRabbitQueueDelayed.name, content, options, callback);
+  } catch (err) {
+    callback(err);
+  }
 }
 function addDelayedActive(taskqueue, content, ttl, callback) {
   const msg = {durable: true, body: content, ttl};
@@ -452,18 +531,23 @@ function addDelayedActive(taskqueue, content, ttl, callback) {
 }
 
 function healthCheckRabbit(taskqueue) {
-  return co(function* () {
-    if (!taskqueue.channelConvertDead) {
-      return false;
-    }
-    const exchange = yield rabbitMQCore.assertExchangePromise(
-      taskqueue.channelConvertDead,
-      cfgRabbitExchangeConvertDead.name,
-      'fanout',
-      cfgRabbitExchangeConvertDead.options
-    );
-    return !!exchange;
-  });
+  if (!taskqueue.connection) {
+    return Promise.resolve(false);
+  }
+  // Pick any available channel; dead-exchange channel may not be configured
+  // (e.g. when isEmitDead=false on DocService side) but conn+other channels
+  // are enough to prove broker reachability.
+  const ch =
+    taskqueue.channelConvertTask ||
+    taskqueue.channelConvertTaskReceive ||
+    taskqueue.channelConvertResponse ||
+    taskqueue.channelConvertResponseReceive ||
+    taskqueue.channelDelayed ||
+    taskqueue.channelConvertDead;
+  if (!ch) {
+    return Promise.resolve(false);
+  }
+  return rabbitMQCore.runHealthCheck(rabbitMQCore.checkQueuePromise(ch, cfgRabbitQueueConvertTask.name), 5000, 'taskqueue healthCheck');
 }
 /**
  * Check ActiveMQ connection health without using a generator.
@@ -533,6 +617,7 @@ if (commonDefines.c_oAscQueueType.rabbitmq === cfgQueueType) {
 
 function TaskQueueRabbitMQ(simulateErrorResponse) {
   this.isClose = false;
+  this.reconnecting = false;
   this.connection = null;
   this.channelConvertTask = null;
   this.channelConvertTaskReceive = null;
@@ -541,6 +626,7 @@ function TaskQueueRabbitMQ(simulateErrorResponse) {
   this.channelConvertResponseReceive = null;
   this.channelDelayed = null;
   this.addTaskStore = [];
+  this.addResponseStore = [];
   this.addDelayedStore = [];
   this.channelConvertTaskData = {};
   this.channelConvertResponseData = {};
@@ -580,6 +666,7 @@ TaskQueueRabbitMQ.prototype.addResponse = function (task) {
         }
       });
     } else {
+      pushBoundedStore(t.addResponseStore, content, 'addResponseStore');
       resolve();
     }
   });
@@ -587,7 +674,7 @@ TaskQueueRabbitMQ.prototype.addResponse = function (task) {
 TaskQueueRabbitMQ.prototype.addDelayed = function (task, ttl) {
   const t = this;
   return new Promise((resolve, reject) => {
-    const content = new Buffer(JSON.stringify(task));
+    const content = Buffer.from(JSON.stringify(task));
     if (null != t.channelDelayed) {
       addDelayed(t, content, ttl, (err, _ok) => {
         if (null != err) {
@@ -597,7 +684,7 @@ TaskQueueRabbitMQ.prototype.addDelayed = function (task, ttl) {
         }
       });
     } else {
-      t.addDelayedStore.push({task: content, ttl});
+      pushBoundedStore(t.addDelayedStore, {task: content, ttl}, 'addDelayedStore');
       resolve();
     }
   });
