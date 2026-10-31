@@ -1583,17 +1583,13 @@ function createSaveTimer(ctx, docId, opt_userId, opt_userIndex, opt_userLcid, op
       }
       while (true) {
         if (!sqlBase.isLockCriticalSection(docId)) {
-          yield canvasService.saveFromChanges(
-            ctx,
-            docId,
-            updateTask.statusInfo,
-            null,
-            opt_userId,
-            opt_userIndex,
-            opt_userLcid,
-            opt_queue,
-            opt_initShardKey
-          );
+          yield canvasService.saveFromChanges(ctx, docId, updateTask.statusInfo, {
+            userId: opt_userId,
+            userIndex: opt_userIndex,
+            userLcid: opt_userLcid,
+            queue: opt_queue,
+            initShardKey: opt_initShardKey
+          });
           break;
         }
         yield utils.sleep(c_oAscLockTimeOutDelay);
@@ -2318,10 +2314,13 @@ exports.install = function (server, app, callbackFunction) {
     }
 
     //Release locks
-    if (releaseLocks && conn) {
+    if (releaseLocks) {
       const userLocks = yield removeUserLocks(ctx, docId, userId);
       if (0 < userLocks.length) {
-        sendReleaseLock(ctx, conn, userLocks);
+        // a lost connection has nobody to notify, but the other participants still must see its locks go
+        if (conn) {
+          sendReleaseLock(ctx, conn, userLocks);
+        }
         yield publish(
           ctx,
           {
@@ -2358,7 +2357,7 @@ exports.install = function (server, app, callbackFunction) {
           ctx.logger.warn('lockDocumentsTimerId timeout');
           delete lockDocumentsTimerId[docId];
           //todo remove checkEndAuthLock(only needed for lost connections in redis)
-          yield* checkEndAuthLock(ctx, true, false, docId, userId);
+          yield* checkEndAuthLock(ctx, true, false, docId, userId, true);
           yield* publishCloseUsersConnection(ctx, docId, [userId], false, constants.DROP_CODE, constants.DROP_REASON);
         } catch (e) {
           ctx.logger.error('lockDocumentsTimerId error: %s', e.stack);
@@ -4689,8 +4688,12 @@ exports.shutdown = function (req, res) {
     try {
       ctx.initFromRequest(req);
       yield ctx.initTenantCache();
-      ctx.logger.info('shutdown start');
-      output = yield shutdown.shutdown(ctx, editorStat, req.method === 'PUT');
+      const isShutdown = req.method === 'PUT';
+      // recovery is on by default; recoverChanges=0 keeps the plain quick drain of the old behavior
+      const recoverChangesParam = req.query?.recoverChanges;
+      const recoverChanges = isShutdown && '0' !== recoverChangesParam && 'false' !== recoverChangesParam;
+      ctx.logger.info('shutdown start: recoverChanges=%s', recoverChanges);
+      output = yield shutdown.shutdown(ctx, editorStat, isShutdown, recoverChanges);
     } catch (err) {
       ctx.logger.error('shutdown error %s', err.stack);
     } finally {
@@ -4741,7 +4744,8 @@ exports.getShutdownStatus = function (req, res) {
     ctx.initFromRequest(req);
     res.setHeader('Content-Type', 'application/json');
     res.json({
-      shutdown: getIsShutdown()
+      shutdown: getIsShutdown(),
+      recovery: shutdown.getLastRecoveryReport()
     });
   } catch (err) {
     ctx.logger.error('getShutdownStatus error %s', err.stack);
