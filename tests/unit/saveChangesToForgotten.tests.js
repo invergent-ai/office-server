@@ -37,6 +37,9 @@
 
 const {afterEach, beforeEach, describe, expect, test, jest: jestApi} = require('@jest/globals');
 
+// Our taskresult is backed by the database; these suites run on the in-memory store.
+jestApi.mock('../../DocService/sources/taskresult', () => jestApi.requireActual('./support/memoryConnector'));
+
 const taskResult = require('../../DocService/sources/taskresult');
 const canvasService = require('../../DocService/sources/canvasservice');
 const commonDefines = require('../../Common/sources/commondefines');

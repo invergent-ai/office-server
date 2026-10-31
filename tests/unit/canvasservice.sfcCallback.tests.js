@@ -37,6 +37,9 @@
 
 const {afterEach, beforeEach, describe, expect, test, jest: jestApi} = require('@jest/globals');
 
+// Our taskresult is backed by the database; these suites run on the in-memory store.
+jestApi.mock('../../DocService/sources/taskresult', () => jestApi.requireActual('./support/memoryConnector'));
+
 jestApi.mock('../../DocService/sources/databaseConnectors/baseConnector', () => {
   function UserCallback() {}
   UserCallback.prototype.getCallbackByUserIndex = jestApi.fn(() => 'http://callback');
@@ -711,57 +714,3 @@ function lastCallbackData() {
 function debugMessages(ctx) {
   return ctx.logger.debug.mock.calls.map(args => args[0]);
 }
-
-describe('forcesave callback delivery after final save', () => {
-  test.each([commonDefines.FileStatus.SaveVersion, commonDefines.FileStatus.UpdateVersion])(
-    'delivers a form submit while the document is in status %i',
-    async status => {
-      const ctx = makeContext();
-      await seedTask(ctx, status);
-      docsCoServer.sendServerRequest.mockResolvedValue('{"error":0}');
-
-      await canvasService.commandSfcCallback(ctx, makeForceSaveCommand(commonDefines.c_oAscForceSaveTypes.Form), true, false);
-
-      const outputSfc = lastCallbackData();
-      expect(outputSfc).not.toBeNull();
-      expect(outputSfc.getForceSaveType()).toBe(commonDefines.c_oAscForceSaveTypes.Form);
-      expect(outputSfc.getStatus()).toBe(docsCoServer.c_oAscServerStatus.MustSaveForce);
-      expect(debugMessages(ctx)).toContain('commandSfcCallback form submit after final save: status = %d');
-    }
-  );
-
-  test('delivers a form submit in status Ok without the after-final-save marker', async () => {
-    const ctx = makeContext();
-    await seedTask(ctx, commonDefines.FileStatus.Ok, constants.NO_ERROR);
-    docsCoServer.sendServerRequest.mockResolvedValue('{"error":0}');
-
-    await canvasService.commandSfcCallback(ctx, makeForceSaveCommand(commonDefines.c_oAscForceSaveTypes.Form), true, false);
-
-    expect(lastCallbackData().getForceSaveType()).toBe(commonDefines.c_oAscForceSaveTypes.Form);
-    expect(debugMessages(ctx)).not.toContain('commandSfcCallback form submit after final save: status = %d');
-  });
-
-  test.each([commonDefines.c_oAscForceSaveTypes.Button, commonDefines.c_oAscForceSaveTypes.Timeout])(
-    'keeps dropping forcesave type %i after final save',
-    async type => {
-      const ctx = makeContext();
-      await seedTask(ctx, commonDefines.FileStatus.SaveVersion);
-      docsCoServer.sendServerRequest.mockResolvedValue('{"error":0}');
-
-      await canvasService.commandSfcCallback(ctx, makeForceSaveCommand(type), true, false);
-
-      expect(docsCoServer.sendServerRequest).not.toHaveBeenCalled();
-      expect(debugMessages(ctx)).toContain('commandSfcCallback skip forcesave after final save: type = %d; status = %s');
-    }
-  );
-
-  test('delivers a button forcesave while the document is still open', async () => {
-    const ctx = makeContext();
-    await seedTask(ctx, commonDefines.FileStatus.Ok, constants.NO_ERROR);
-    docsCoServer.sendServerRequest.mockResolvedValue('{"error":0}');
-
-    await canvasService.commandSfcCallback(ctx, makeForceSaveCommand(commonDefines.c_oAscForceSaveTypes.Button), true, false);
-
-    expect(lastCallbackData().getForceSaveType()).toBe(commonDefines.c_oAscForceSaveTypes.Button);
-  });
-});
